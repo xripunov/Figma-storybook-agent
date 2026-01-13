@@ -123,6 +123,22 @@ TOOL_DEFINITIONS = [
             },
             required=["url"]
         )
+    ),
+    types.FunctionDeclaration(
+        name="read_notes",
+        description="Прочитать свои заметки (память). Используй в начале сложной задачи, чтобы вспомнить контекст проекта и предыдущие находки.",
+        parameters=types.Schema(type="OBJECT", properties={}, required=[])
+    ),
+    types.FunctionDeclaration(
+        name="write_notes",
+        description="Записать важную информацию в память. Используй, когда узнаёшь что-то полезное о проекте (токены, правила, решения).",
+        parameters=types.Schema(
+            type="OBJECT",
+            properties={
+                "content": types.Schema(type="STRING", description="Текст заметки для добавления")
+            },
+            required=["content"]
+        )
     )
 ]
 
@@ -147,6 +163,12 @@ SYSTEM_PROMPT = """Ты — ИИ-ассистент для работы с ди�
 - ui-kit — основные компоненты
 - foundation — стили
 - icons, content, organisms
+
+## Память:
+У тебя есть долгосрочная память (`read_notes`, `write_notes`). 
+- В начале сложной задачи — прочитай заметки, чтобы вспомнить контекст.
+- Когда узнаёшь что-то важное — запиши это (правила проекта, найденные токены, решения).
+- Пример записи: "Для кнопок используется токен sys.primary. Радиус углов: 8px."
 
 ## Алгоритм:
 1. Ссылка на Figma -> `analyze_design_link`
@@ -327,6 +349,34 @@ async def execute_tool(name: str, args: dict) -> str:
 📖 **Краткое описание:**
 {guide}
 """
+
+        elif name == "read_notes":
+            notes_path = ".notes/memory.md"
+            if os.path.exists(notes_path):
+                with open(notes_path, "r", encoding="utf-8") as f:
+                    content = f.read()
+                if content.strip():
+                    return f"📝 **Твои заметки:**\n\n{content}"
+                else:
+                    return "📝 Заметки пусты. Ты ещё ничего не записывал."
+            else:
+                return "📝 Заметки пусты. Ты ещё ничего не записывал."
+        
+        elif name == "write_notes":
+            notes_dir = ".notes"
+            notes_path = f"{notes_dir}/memory.md"
+            
+            if not os.path.exists(notes_dir):
+                os.makedirs(notes_dir)
+            
+            # Append new note with timestamp
+            timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+            new_note = f"\n---\n**[{timestamp}]**\n{args['content']}\n"
+            
+            with open(notes_path, "a", encoding="utf-8") as f:
+                f.write(new_note)
+            
+            return f"✅ Записано в память:\n{args['content']}"
 
         else:
             return f"❌ Неизвестный инструмент: {name}"
