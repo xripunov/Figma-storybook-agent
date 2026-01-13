@@ -1,0 +1,17 @@
+name: design-system-agent
+version: 0.1.0
+schema: v1
+
+mcpServers:
+  # Storybook MCP (already running)
+  - name: tochka-ui
+    type: streamable-http
+    url: "https://ui-kit-mcp-server-tochka-ui.query.consul-test/mcp"
+  
+  # Figma MCP (Framelink)
+  - name: figma
+    type: stdio
+    command: npx
+    args: ["-y", "figma-developer-mcp", "--stdio"]
+    env:
+      FIGMA_API_KEY: "${FIGMA_API_KEY}"

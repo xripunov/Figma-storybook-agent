@@ -1,0 +1,10 @@
+.env
+venv/
+__pycache__/
+*.pyc
+.DS_Store
+.chats/
+chat_history.db
+db.sqlite
+*.db
+.chainlit/
