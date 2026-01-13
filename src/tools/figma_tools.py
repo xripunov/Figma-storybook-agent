@@ -6,8 +6,22 @@ import httpx
 import os
 from typing import Optional
 from dataclasses import dataclass
+from dotenv import load_dotenv
+
+load_dotenv()
 
 FIGMA_API_BASE = "https://api.figma.com/v1"
+
+# File keys from environment
+FIGMA_UI_KIT_KEY = os.getenv("FIGMA_UI_KIT_FILE_KEY", "fRi3HAgxLDuHW4MJQPf5r3")
+FIGMA_PATTERNS_KEY = os.getenv("FIGMA_PATTERNS_FILE_KEY", "CBS0qZz6lqoU2Mh3StNwV7")
+
+
+def generate_figma_link(file_key: str, node_id: str) -> str:
+    """Generate a direct link to a Figma frame."""
+    # Convert node_id from 123:456 to 123-456 for URL
+    url_node_id = node_id.replace(":", "-") if node_id else ""
+    return f"https://www.figma.com/design/{file_key}?node-id={url_node_id}"
 
 
 @dataclass
@@ -93,12 +107,20 @@ async def get_component_guide(file_key: str, component_name: str) -> Optional[st
         # Find the guide frame node ID
         guide_node_id = None
         
+        # Normalize for comparison: remove spaces, lowercase
+        target_clean = component_name.lower().replace(" ", "")
+        
         def find_guide_frame(node: dict):
             nonlocal guide_node_id
             name = node.get("name", "")
-            if name.lower() == guide_name.lower():
-                guide_node_id = node.get("id")
-                return True
+            name_clean = name.lower().replace(" ", "")
+            
+            # Check for "Guide" and Component Name
+            # Matches: "Link Cell / Guide", "LinkCell / Guide", "Link Cell Guide"
+            if "guide" in name.lower() and target_clean in name_clean:
+                 guide_node_id = node.get("id")
+                 return True
+                 
             for child in node.get("children", []):
                 if find_guide_frame(child):
                     return True
@@ -148,25 +170,84 @@ async def get_component_info(file_key: str, component_name: str) -> Optional[dic
 
 
 async def search_components(query: str, file_key: Optional[str] = None) -> list[dict]:
-    """Search for components across the design system."""
+    """Search for components across the design system.
+    
+    Results are ranked: exact match > starts_with > contains
+    """
     # Default to UI Kit if no file specified
     if not file_key:
         file_key = "fRi3HAgxLDuHW4MJQPf5r3"  # Bank 02 UI Kit
     
     components = await list_components(file_key)
     
-    # Search by name
-    query_lower = query.lower()
-    matches = [c for c in components if query_lower in c["name"].lower()]
+    query_lower = query.lower().strip()
     
-    # Also search in containing frame name
-    matches.extend([
+    # Tier 1: Exact match on containing_frame name (best - this is the component group)
+    exact_frame = [
         c for c in components 
-        if query_lower in c.get("containing_frame", {}).get("name", "").lower()
-        and c not in matches
-    ])
+        if c.get("containing_frame", {}).get("name", "").lower().strip() == query_lower
+    ]
     
-    return matches[:20]  # Limit results
+    # Tier 2: Exact match on component name
+    exact_name = [
+        c for c in components 
+        if c["name"].lower().strip() == query_lower
+        and c not in exact_frame
+    ]
+    
+    # Tier 3: Frame starts with query
+    starts_frame = [
+        c for c in components 
+        if c.get("containing_frame", {}).get("name", "").lower().startswith(query_lower)
+        and c not in exact_frame and c not in exact_name
+    ]
+    
+    # Tier 4: Name starts with query
+    starts_name = [
+        c for c in components 
+        if c["name"].lower().startswith(query_lower)
+        and c not in exact_frame and c not in exact_name and c not in starts_frame
+    ]
+    
+    # Tier 5: Fuzzy match (ignore spaces)
+    # Helper to clean string for fuzzy comparison
+    def clean(s): return s.lower().replace(" ", "").replace("-", "").replace("_", "")
+    query_clean = clean(query)
+    
+    fuzzy_matches = []
+    seen = set(c["node_id"] for c in exact_frame + exact_name + starts_frame + starts_name)
+    
+    if len(query_clean) > 3: # Only fuzzy search if query has substance
+        for c in components:
+            if c["node_id"] in seen:
+                continue
+                
+            frame = c.get("containing_frame", {}).get("name", "")
+            name = c["name"]
+            
+            # Check frame name fuzzy
+            if query_clean in clean(frame):
+                fuzzy_matches.append(c)
+                seen.add(c["node_id"])
+                continue
+                
+            # Check component name fuzzy
+            if query_clean in clean(name):
+                fuzzy_matches.append(c)
+                seen.add(c["node_id"])
+
+    # Tier 6: Standard Contains match (fallback)
+    contains = [
+        c for c in components 
+        if (query_lower in c["name"].lower() or 
+            query_lower in c.get("containing_frame", {}).get("name", "").lower())
+        and c["node_id"] not in seen
+    ]
+    
+    # Combine in priority order
+    results = exact_frame + exact_name + starts_frame + starts_name + fuzzy_matches + contains
+    
+    return results[:20]  # Limit results
 
 
 async def get_component_variants(file_key: str, component_name: str) -> list[dict]:
@@ -307,12 +388,22 @@ async def get_file_styles(file_key: str) -> dict:
         return mapping
 
 
-def _extract_tokens_recursive(node: dict, var_map: dict, style_map: dict, tokens: list, path: list):
-    """Recursively find boundVariables and styles."""
+def _rgb_to_hex(r: float, g: float, b: float) -> str:
+    """Convert RGB (0-1 range) to HEX color."""
+    return f"#{int(r*255):02x}{int(g*255):02x}{int(b*255):02x}"
+
+
+def _extract_tokens_recursive(node: dict, var_map: dict, style_map: dict, tokens: list, raw_props: list, path: list):
+    """Recursively find boundVariables, styles, and raw properties."""
     node_name = node.get("name", "Unknown")
-    curr_path =  f"{path[-1]} > {node_name}" if path else node_name
+    node_type = node.get("type", "")
+    curr_path = f"{path[-1]} > {node_name}" if path else node_name
     
-    # 1. Variables
+    # Skip hidden nodes
+    if not node.get("visible", True):
+        return
+    
+    # 1. Bound Variables (Tokens)
     bound_vars = node.get("boundVariables", {})
     if bound_vars:
         for prop, val in bound_vars.items():
@@ -320,14 +411,12 @@ def _extract_tokens_recursive(node: dict, var_map: dict, style_map: dict, tokens
                 var_name = var_map.get(val["id"])
                 if var_name:
                     tokens.append(f"{curr_path} ({prop}): 🔹 {var_name}")
-            # Fills/Strokes are lists in boundVariables sometimes?
-            # Figma API: 'fills' in boundVariables is list of variable aliases matching fills array index
             elif isinstance(val, list):
-                 for i, alias in enumerate(val):
-                     if isinstance(alias, dict) and "id" in alias:
-                         var_name = var_map.get(alias["id"])
-                         if var_name:
-                             tokens.append(f"{curr_path} ({prop}[{i}]): 🔹 {var_name}")
+                for i, alias in enumerate(val):
+                    if isinstance(alias, dict) and "id" in alias:
+                        var_name = var_map.get(alias["id"])
+                        if var_name:
+                            tokens.append(f"{curr_path} ({prop}[{i}]): 🔹 {var_name}")
 
     # 2. Styles
     styles = node.get("styles", {})
@@ -335,13 +424,48 @@ def _extract_tokens_recursive(node: dict, var_map: dict, style_map: dict, tokens
         for prop, style_id in styles.items():
             style_name = style_map.get(style_id)
             if style_name:
-                 tokens.append(f"{curr_path} ({prop}): 🔸 {style_name}")
-                 
-    # Recurse
-    # Limit depth to avoid massive dumps?
-    if len(path) < 5: 
+                tokens.append(f"{curr_path} ({prop}): 🔸 {style_name}")
+    
+    # 3. Raw Properties (when no tokens/styles are bound)
+    # Only extract from top-level important nodes to avoid noise
+    if len(path) < 3:  # Limit depth for raw props
+        # Fills (background colors)
+        fills = node.get("fills", [])
+        for i, fill in enumerate(fills):
+            if fill.get("type") == "SOLID" and fill.get("visible", True):
+                color = fill.get("color", {})
+                if color:
+                    hex_color = _rgb_to_hex(color.get("r", 0), color.get("g", 0), color.get("b", 0))
+                    opacity = fill.get("opacity", 1)
+                    opacity_str = f" ({int(opacity*100)}%)" if opacity < 1 else ""
+                    raw_props.append(f"{curr_path} (fill): 🎨 {hex_color}{opacity_str}")
+        
+        # Corner radius
+        corner = node.get("cornerRadius")
+        if corner and corner > 0:
+            raw_props.append(f"{curr_path} (radius): 📐 {corner}px")
+        
+        # Strokes
+        strokes = node.get("strokes", [])
+        for stroke in strokes:
+            if stroke.get("type") == "SOLID" and stroke.get("visible", True):
+                color = stroke.get("color", {})
+                if color:
+                    hex_color = _rgb_to_hex(color.get("r", 0), color.get("g", 0), color.get("b", 0))
+                    weight = node.get("strokeWeight", 1)
+                    raw_props.append(f"{curr_path} (stroke): ✏️ {hex_color} ({weight}px)")
+        
+        # Text properties
+        if node_type == "TEXT":
+            font_name = node.get("style", {}).get("fontFamily") or node.get("fontName", {}).get("family")
+            font_size = node.get("style", {}).get("fontSize") or node.get("fontSize")
+            if font_name or font_size:
+                raw_props.append(f"{curr_path} (text): 🔤 {font_name or ''} {font_size}px")
+    
+    # Recurse into children
+    if len(path) < 5:
         for child in node.get("children", []):
-            _extract_tokens_recursive(child, var_map, style_map, tokens, path + [node_name])
+            _extract_tokens_recursive(child, var_map, style_map, tokens, raw_props, path + [node_name])
 
 
 async def get_component_details(file_key: str, query: str) -> dict:
@@ -349,10 +473,19 @@ async def get_component_details(file_key: str, query: str) -> dict:
     
     This is a "super tool" that combines search, variants, guide, and property inspection.
     """
+    import datetime
+    def log(msg):
+        with open("figma_debug.log", "a") as f:
+            f.write(f"[{datetime.datetime.now()}] {msg}\n")
+
+    log(f"--- START get_component_details: {query} ---")
+
     # 1. Search to find precise name/frame
     search_results = await search_components(query, file_key)
+    log(f"Search results count: {len(search_results)}")
     
     if not search_results:
+        log("No search results found.")
         return {"error": f"Компоненты по запросу '{query}' не найдены"}
     
     # 2. Pick the best match to query for details
@@ -360,12 +493,21 @@ async def get_component_details(file_key: str, query: str) -> dict:
     target_name = best_match.get("name")
     target_id = best_match.get("node_id")
     
-    # ... (Search logic matches query to frame name) ...
+    # Helper for fuzzy comparison
+    def clean(s): return s.lower().replace(" ", "").replace("-", "").replace("_", "")
+    query_clean = clean(query)
+    
+    # Try to find a Component Set (containing frame) that matches the query
     for res in search_results:
-        frame = res.get("containing_frame", {}).get("name", "")
-        if query.lower() in frame.lower():
-            target_name = frame
-            target_id = res.get("node_id")
+        frame_name = res.get("containing_frame", {}).get("name", "")
+        frame_id = res.get("containing_frame", {}).get("nodeId")
+        frame_clean = clean(frame_name)
+        
+        # Check if query matches the Frame name (fuzzy)
+        if query_clean in frame_clean or frame_clean in query_clean:
+            log(f"Found better target via fuzzy match: {frame_name} (was {target_name})")
+            target_name = frame_name
+            target_id = frame_id or res.get("node_id")
             break
             
     if not target_name:
@@ -375,44 +517,141 @@ async def get_component_details(file_key: str, query: str) -> dict:
     variants = await get_component_variants(file_key, target_name)
     guide = await get_component_guide(file_key, target_name)
     
-    image_url = None
-    node_props = {}
-    
-    if target_id:
-        image_url = await get_node_image(file_key, target_id)
-        node_data = await get_node_data(file_key, target_id)
-        
-        if node_data:
-            # Fetch maps
-            var_map = await get_file_variables(file_key)
-            style_map = await get_file_styles(file_key)
-            
-            resolved_props = []
-            _extract_tokens_recursive(node_data, var_map, style_map, resolved_props, [])
-            
-            # Deduplicate and sort
-            resolved_props = sorted(list(set(resolved_props)))
-            
-            if resolved_props:
-                node_props["tokens"] = resolved_props
-
-    
     # Also try to get guide for the query itself if target_name didn't work
     if not guide and target_name.lower() != query.lower():
         guide = await get_component_guide(file_key, query)
 
+    # 3.5 Extract properties from target node (Component Set)
+    node_props = {}
+    if target_id:
+        node_data = await get_node_data(file_key, target_id)
+        log(f"Got node_data for target_id {target_id}: {node_data is not None}")
+        
+        if node_data:
+            # Extract component properties (for code generation)
+            comp_props = node_data.get("componentPropertyDefinitions", {})
+            if comp_props:
+                node_props["definitions"] = comp_props
+                
+                # Create readable summary
+                summary_lines = []
+                for prop_name, prop_def in comp_props.items():
+                    p_type = prop_def.get("type")
+                    if p_type == "VARIANT":
+                        opts = prop_def.get("variantOptions", [])
+                        summary_lines.append(f"• {prop_name}: {', '.join(opts)}")
+                    elif p_type == "BOOLEAN":
+                        summary_lines.append(f"• {prop_name}: True/False")
+                    elif p_type == "TEXT":
+                        summary_lines.append(f"• {prop_name}: Text")
+                
+                node_props["summary"] = "\n".join(summary_lines)
+                log(f"Extracted props summary with {len(summary_lines)} lines")
+
+    # 4. Find the best "Cover" image (Top-level frame named same as component)
+    image_url = None
+    page_id = best_match.get("containing_frame", {}).get("pageId")
+    
+    log(f"Trying to find cover image. PageID: {page_id}")
+
+    
+    if page_id:
+        # Try to find a top-level frame that exactly matches the component name
+        cover_node_id = await find_top_level_frame(file_key, page_id, target_name)
+        log(f"find_top_level_frame result: {cover_node_id}")
+        
+        if cover_node_id:
+            image_url = await get_node_image(file_key, cover_node_id)
+            log(f"Got image URL from cover: {image_url is not None}")
+            
+    # Fallback to Component Set or direct ID if no cover found
+    if not image_url and target_id:
+        log(f"Fallback to target_id: {target_id}")
+        image_url = await get_node_image(file_key, target_id)
+        
+    # Log properties count
+    log(f"Props extracted: definitions={len(node_props.get('definitions', {}))}, summary_len={len(node_props.get('summary', ''))}")
+        
+    # 5. Build Figma link
+    figma_link = None
+    if target_id:
+        figma_link = generate_figma_link(file_key, target_id)
+        
     return {
         "found_name": target_name,
         "search_matches": [
             f"{c['name']} (Frame: {c.get('containing_frame', {}).get('name', '')})" 
             for c in search_results[:5]
         ],
-        "variants": [v['name'] for v in variants[:20]],
+        "variants": [], 
         "variants_count": len(variants),
         "guide": guide,
         "image_url": image_url,
-        "props": node_props
+        "figma_link": figma_link,
+        "props": node_props,
+        "_debug_info": {
+            "page_id": page_id,
+            "target_id": target_id,
+            "best_match_frame": best_match.get("containing_frame"),
+            "image_found_via": "cover" if page_id and image_url and image_url != (await get_node_image(file_key, target_id) if target_id else None) else "target_id",
+            "props_count": len(node_props.get("definitions", {}))
+        }
     }
+
+async def find_top_level_frame(file_key: str, page_id: str, name: str) -> Optional[str]:
+    """Find a top-level frame (or inside Section) that matches the name."""
+    import datetime
+    def log(msg):
+        with open("figma_debug.log", "a") as f:
+            f.write(f"[{datetime.datetime.now()}] [find_top_level] {msg}\n")
+
+    config = get_config()
+    target_clean = name.lower().replace(" ", "")
+    log(f"Searching for '{name}' (clean: {target_clean}) in page {page_id}")
+    
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        # Depth 3 covers Page -> Section -> Frame
+        resp = await client.get(
+            f"{FIGMA_API_BASE}/files/{file_key}/nodes",
+            params={"ids": page_id, "depth": 3},
+            headers={"X-Figma-Token": config.api_key}
+        )
+        if resp.status_code != 200:
+            log(f"Error fetching page nodes: {resp.status_code}")
+            return None
+            
+        data = resp.json()
+        page_node = data.get("nodes", {}).get(page_id, {}).get("document", {})
+        
+        found_id = None
+        
+        def search_recursive(node, depth=0):
+            nonlocal found_id
+            if found_id: return
+            
+            node_name = node.get("name", "")
+            node_type = node.get("type", "")
+            clean_name = node_name.lower().replace(" ", "")
+            node_id = node.get("id")
+            
+            # log(f"[{depth}] Checking {node_type}: {node_name} ({node_id})")
+            
+            # Check match (Frame, Component, Component Set)
+            if clean_name == target_clean and node_type in ["FRAME", "COMPONENT_SET", "COMPONENT", "SECTION"]:
+                log(f"FOUND MATCH! {node_name} ({node_id})")
+                found_id = node["id"]
+                return
+
+            if "children" in node:
+                for child in node["children"]:
+                    search_recursive(child, depth + 1)
+                    
+        search_recursive(page_node)
+        
+        if not found_id:
+             log("No match found after recursive search.")
+             
+        return found_id
 
 
 def parse_figma_url(url: str) -> dict:
@@ -572,7 +811,8 @@ async def analyze_figma_url(url: str) -> dict:
 # File key mapping for convenience
 FILE_KEYS = {
     "foundation": "4ELwCVLtFVJEOvTWTMgzoc",
-    "ui-kit": "fRi3HAgxLDuHW4MJQPf5r3",
+    "ui-kit": FIGMA_UI_KIT_KEY,
+    "patterns": FIGMA_PATTERNS_KEY,
     "organisms": "JbfXQWGV0BhKVA1RLwn5V9",
     "content": "orK6ik3Y3jz9Kdae26Xd4D",
     "local-components": "FwE8tG9F5b1tzOCiwEia1b",
@@ -591,3 +831,308 @@ FILE_KEYS = {
 def get_file_key(name: str) -> str:
     """Get file key by friendly name."""
     return FILE_KEYS.get(name.lower(), name)
+
+
+# =============================================================================
+# PATTERNS TOOLS
+# =============================================================================
+
+async def list_patterns() -> list[dict]:
+    """List all patterns (pages) from the Bank Patterns file.
+    
+    Each page in the Patterns file is a separate pattern topic.
+    Returns list of pages with their IDs.
+    """
+    config = get_config()
+    
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        resp = await client.get(
+            f"{FIGMA_API_BASE}/files/{FIGMA_PATTERNS_KEY}",
+            params={"depth": 1},  # Just get pages
+            headers={"X-Figma-Token": config.api_key}
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        
+        pages = []
+        document = data.get("document", {})
+        for child in document.get("children", []):
+            if child.get("type") == "CANVAS":
+                pages.append({
+                    "name": child.get("name"),
+                    "id": child.get("id"),
+                    "type": "pattern"
+                })
+        
+        return pages
+
+
+async def search_patterns(query: str) -> list[dict]:
+    """Search for patterns by name.
+    
+    Searches across all pattern pages in the Bank Patterns file.
+    Results are ranked: exact match > starts_with > contains.
+    """
+    patterns = await list_patterns()
+    
+    query_lower = query.lower().strip()
+    
+    # Tier 1: Exact match
+    exact = [p for p in patterns if p["name"].lower().strip() == query_lower]
+    
+    # Tier 2: Starts with
+    starts = [p for p in patterns 
+              if p["name"].lower().startswith(query_lower) and p not in exact]
+    
+    # Tier 3: Contains
+    contains = [p for p in patterns 
+                if query_lower in p["name"].lower() 
+                and p not in exact and p not in starts]
+    
+    return exact + starts + contains
+
+
+async def get_pattern_info(pattern_name: str) -> dict:
+    """Get detailed info about a pattern.
+    
+    Patterns are pages in the Bank Patterns file.
+    This function fetches the guide (if exists as a frame named like the page),
+    renders an image, and returns with a Figma link.
+    """
+    config = get_config()
+    
+    # 1. Find the pattern page
+    patterns = await search_patterns(pattern_name)
+    
+    if not patterns:
+        return {"error": f"Паттерн '{pattern_name}' не найден"}
+    
+    best_match = patterns[0]
+    page_id = best_match["id"]
+    page_name = best_match["name"]
+    
+    # 2. Get page content to find guide frame
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        resp = await client.get(
+            f"{FIGMA_API_BASE}/files/{FIGMA_PATTERNS_KEY}/nodes",
+            params={"ids": page_id, "depth": 2},
+            headers={"X-Figma-Token": config.api_key}
+        )
+        resp.raise_for_status()
+        nodes_data = resp.json()
+        
+        page_node = nodes_data.get("nodes", {}).get(page_id, {}).get("document", {})
+        
+        # Look for guide frame (named same as page or "Guide")
+        guide_frame_id = None
+        guide_text = None
+        examples = []
+        all_frames = []
+        
+        for child in page_node.get("children", []):
+            child_name = child.get("name", "").lower()
+            child_type = child.get("type", "")
+            
+            if child_type == "FRAME" or child_type == "SECTION":
+                # Store all frames for fallback text extraction
+                # Sort key: x position (to read left-to-right)
+                x_pos = child.get("absoluteBoundingBox", {}).get("x", 0)
+                all_frames.append((x_pos, child))
+                
+                # Check for explicit guide frame
+                if "guide" in child_name or child_name == page_name.lower():
+                    guide_frame_id = child.get("id")
+                elif "guide" not in child_name:
+                    examples.append({
+                        "name": child.get("name"),
+                        "id": child.get("id")
+                    })
+        
+        # 3. Extract text
+        if guide_frame_id:
+            # Case A: Found explicit guide frame
+            resp = await client.get(
+                f"{FIGMA_API_BASE}/files/{FIGMA_PATTERNS_KEY}/nodes",
+                params={"ids": guide_frame_id},
+                headers={"X-Figma-Token": config.api_key}
+            )
+            resp.raise_for_status()
+            guide_data = resp.json()
+            guide_node = guide_data.get("nodes", {}).get(guide_frame_id, {}).get("document", {})
+            
+            texts = []
+            _extract_text_from_node(guide_node, texts)
+            if texts:
+                guide_text = "\n\n".join(texts)
+                
+        else:
+            # Case B: No explicit guide frame -> Aggregate text from ALL frames
+            # Sort frames left-to-right
+            all_frames.sort(key=lambda x: x[0])
+            
+            # Limit to first 5 frames to avoid too much noise, or just take all?
+            # Let's take all frames that look like text content (e.g. not named "Example")
+            # For now, let's take up to 10 frames
+            sorted_frames = [f[1] for f in all_frames[:10]]
+            
+            # We need to fetch full content for these frames
+            frame_ids = [f["id"] for f in sorted_frames]
+            if frame_ids:
+                resp = await client.get(
+                    f"{FIGMA_API_BASE}/files/{FIGMA_PATTERNS_KEY}/nodes",
+                    params={"ids": ",".join(frame_ids)},
+                    headers={"X-Figma-Token": config.api_key}
+                )
+                if resp.status_code == 200:
+                    nodes_data = resp.json().get("nodes", {})
+                    all_texts = []
+                    
+                    for fid in frame_ids:
+                        f_node = nodes_data.get(fid, {}).get("document", {})
+                        f_name = f_node.get("name", "")
+                        f_texts = []
+                        _extract_text_from_node(f_node, f_texts)
+                        
+                        if f_texts:
+                            # Add frame name as header if it has text
+                            section_text = f"### {f_name}\n" + "\n".join(f_texts)
+                            all_texts.append(section_text)
+                    
+                    if all_texts:
+                        guide_text = "\n\n".join(all_texts)
+        
+        # 4. Get image of the pattern page (first meaningful frame)
+        image_url = None
+        # Use first frame from sorted list if available
+        render_frame_id = guide_frame_id
+        if not render_frame_id and all_frames:
+             # Sort again just to be sure
+             all_frames.sort(key=lambda x: x[0])
+             render_frame_id = all_frames[0][1]["id"]
+             
+        if render_frame_id:
+            image_url = await get_node_image(FIGMA_PATTERNS_KEY, render_frame_id)
+        
+        # 5. Generate Figma link
+        figma_link = generate_figma_link(FIGMA_PATTERNS_KEY, page_id)
+        
+        return {
+            "name": page_name,
+            "type": "pattern",
+            "guide": guide_text,
+            "examples": [e["name"] for e in examples[:10]],
+            "image_url": image_url,
+            "figma_link": figma_link,
+            "related_patterns": [p["name"] for p in patterns[1:5]] if len(patterns) > 1 else []
+        }
+
+
+async def get_variant_image(component_name: str, description: str) -> dict:
+    """Find and render a specific variant of a component.
+    
+    Args:
+        component_name: Name of the component (e.g. "Button")
+        description: Description of properties (e.g. "small primary disabled")
+        
+    Returns:
+        dict with 'image_url' and 'variant_name'
+    """
+    # 1. Get all variants
+    variants = await get_component_variants(FIGMA_UI_KIT_KEY, component_name)
+    
+    if not variants:
+        return {"error": f"Component '{component_name}' not found or has no variants."}
+    
+    # 2. Score variants based on description match
+    desc_words = set(description.lower().split())
+    best_variant = None
+    best_score = -1
+    
+    for v in variants:
+        v_name = v["name"]
+        # Parse name "Type=Primary, Size=Small" -> set("primary", "small")
+        props_str = v_name.replace("=", " ").replace(",", " ")
+        v_words = set(props_str.lower().split())
+        
+        # Calculate score: intersection size
+        score = len(desc_words.intersection(v_words))
+        
+        # Determine if it is a 'default' variant logic if no strict match?
+        # Just simple scoring for now
+        
+        if score > best_score:
+            best_score = score
+            best_variant = v
+        elif score == best_score and best_variant is None:
+             best_variant = v
+             
+    if not best_variant:
+        # Fallback to first if absolutely no match (should unlikely happen if list not empty)
+        best_variant = variants[0]
+        
+    # 3. Get image
+    variant_id = best_variant.get("node_id")
+    image_url = await get_node_image(FIGMA_UI_KIT_KEY, variant_id)
+    
+    return {
+        "variant_name": best_variant.get("name"),
+        "image_url": image_url,
+        "description_match_score": best_score
+    }
+
+
+
+async def search_design_system(query: str) -> list[dict]:
+    """Universal search across components, organisms, and patterns.
+    
+    Searches UI Kit, Organisms, and Bank Patterns files.
+    Returns results with type indicator.
+    """
+    import asyncio
+    
+    # Get organisms file key
+    organisms_key = FILE_KEYS.get("organisms", "JbfXQWGV0BhKVA1RLwn5V9")
+    
+    # Search in parallel
+    components_task = search_components(query, FIGMA_UI_KIT_KEY)
+    organisms_task = search_components(query, organisms_key)
+    patterns_task = search_patterns(query)
+    
+    components, organisms, patterns = await asyncio.gather(
+        components_task, organisms_task, patterns_task
+    )
+    
+    results = []
+    
+    # Add components
+    for c in components[:8]:
+        results.append({
+            "type": "component",
+            "name": c.get("containing_frame", {}).get("name") or c.get("name"),
+            "file_key": FIGMA_UI_KIT_KEY,
+            "node_id": c.get("node_id"),
+            "source": "ui-kit"
+        })
+    
+    # Add organisms
+    for o in organisms[:5]:
+        results.append({
+            "type": "organism",
+            "name": o.get("containing_frame", {}).get("name") or o.get("name"),
+            "file_key": organisms_key,
+            "node_id": o.get("node_id"),
+            "source": "organisms"
+        })
+    
+    # Add patterns
+    for p in patterns[:5]:
+        results.append({
+            "type": "pattern", 
+            "name": p["name"],
+            "file_key": FIGMA_PATTERNS_KEY,
+            "node_id": p["id"],
+            "source": "patterns"
+        })
+    
+    return results
+
